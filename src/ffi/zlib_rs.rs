@@ -103,6 +103,28 @@ impl InflateBackend for Inflate {
         let total_in_start = self.inner.total_in();
         let total_out_start = self.inner.total_out();
 
+        // Cancellation note: flate2 polls the caller's CancelCheck one layer up
+        // in zio.rs, between backend calls — backend-agnostic, and enough for
+        // the streaming wrappers, which hand each call only a small refill chunk
+        // of output.
+        //
+        // TODO(cancel): wire flate2's CancelCheck into true in-call cancellation
+        // once zlib-rs publishes `Inflate::decompress_with_cancel` (present on
+        // zlib-rs's cooperative-cancellation branch, not yet in a release).
+        // flate2's and zlib-rs's CancelCheck are separate vendored traits, but
+        // any `Fn() -> bool` satisfies zlib-rs's via its blanket impl, so the
+        // bridge is a single closure; mem.rs would pick plain vs _with_cancel by
+        // `cancel.may_cancel()`, keeping the no-cancel path free:
+        //
+        //     let result = match cancel {
+        //         Some(c) => self.inner.decompress_with_cancel(input, output, flush, &|| c.is_cancelled()),
+        //         None    => self.inner.decompress(input, output, flush),
+        //     };
+        //
+        // This matters for the low-level path: when a single call is given a
+        // large output buffer, its runtime is driven by the stream's expansion,
+        // which is not knowable from the input length — so only an in-call poll
+        // bounds latency there.
         let result = self.inner.decompress(input, output, flush);
 
         self.total_in += self.inner.total_in() - total_in_start;
@@ -194,6 +216,12 @@ impl DeflateBackend for Deflate {
         let total_in_start = self.inner.total_in();
         let total_out_start = self.inner.total_out();
 
+        // TODO(cancel): zlib-rs also exposes `Deflate::compress_with_cancel`
+        // (same unreleased branch). Lower priority than the inflate side above:
+        // compression does not amplify its input, so a single `compress` call's
+        // runtime is bounded by the input length and the zio.rs poll between
+        // calls already bounds cancel latency. The same one-closure bridge
+        // applies if/when it's enabled.
         let result = self.inner.compress(input, output, flush);
 
         self.total_in += self.inner.total_in() - total_in_start;

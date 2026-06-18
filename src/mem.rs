@@ -2,7 +2,9 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::mem::MaybeUninit;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 
+use crate::cancel::CancelCheck;
 use crate::ffi::{self, Backend, Deflate, DeflateBackend, ErrorMessage, Inflate, InflateBackend};
 use crate::Compression;
 
@@ -18,9 +20,18 @@ use crate::Compression;
 ///
 /// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
 /// [`Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
-#[derive(Debug)]
 pub struct Compress {
     inner: Deflate,
+    cancel: Option<Box<dyn CancelCheck + UnwindSafe + RefUnwindSafe>>,
+}
+
+impl fmt::Debug for Compress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Compress")
+            .field("inner", &self.inner)
+            .field("has_cancel", &self.cancel.is_some())
+            .finish()
+    }
 }
 
 /// Raw in-memory decompression stream for blocks of data.
@@ -35,9 +46,18 @@ pub struct Compress {
 ///
 /// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
 /// [`Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
-#[derive(Debug)]
 pub struct Decompress {
     inner: Inflate,
+    cancel: Option<Box<dyn CancelCheck + UnwindSafe + RefUnwindSafe>>,
+}
+
+impl fmt::Debug for Decompress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Decompress")
+            .field("inner", &self.inner)
+            .field("has_cancel", &self.cancel.is_some())
+            .finish()
+    }
 }
 
 /// Values which indicate the form of flushing to be used when compressing
@@ -198,6 +218,7 @@ impl Compress {
     pub fn new(level: Compression, zlib_header: bool) -> Compress {
         Compress {
             inner: Deflate::make(level, zlib_header, ffi::MZ_DEFAULT_WINDOW_BITS as u8),
+            cancel: None,
         }
     }
 
@@ -225,6 +246,7 @@ impl Compress {
         );
         Compress {
             inner: Deflate::make(level, zlib_header, window_bits),
+            cancel: None,
         }
     }
 
@@ -248,6 +270,7 @@ impl Compress {
         );
         Compress {
             inner: Deflate::make(level, true, window_bits + 16),
+            cancel: None,
         }
     }
 
@@ -339,6 +362,49 @@ impl Compress {
         }
     }
 
+    /// Sets a cooperative cancellation check, polled while this compressor is
+    /// driven by a streaming `Read`/`Write` adaptor.
+    ///
+    /// When the check fires, the adaptor aborts with an error of kind
+    /// [`io::ErrorKind::Interrupted`]. Passing [`NeverCancel`](crate::NeverCancel)
+    /// (or any check whose [`may_cancel`](CancelCheck::may_cancel) is `false`) clears it.
+    /// Any `Fn() -> bool` that is `Send + Sync` works as the check.
+    ///
+    /// The check must also be [`UnwindSafe`] + [`RefUnwindSafe`]: it is stored in
+    /// this value, which a caller may move across a [`catch_unwind`] boundary, so
+    /// requiring it keeps `Compress` unwind-safe. Ordinary cancel sources — an
+    /// `Arc<AtomicBool>`, a cancellation token — satisfy this automatically.
+    ///
+    /// [`io::ErrorKind::Interrupted`]: std::io::ErrorKind::Interrupted
+    /// [`UnwindSafe`]: std::panic::UnwindSafe
+    /// [`RefUnwindSafe`]: std::panic::RefUnwindSafe
+    /// [`catch_unwind`]: std::panic::catch_unwind
+    pub fn set_cancel(&mut self, cancel: impl CancelCheck + UnwindSafe + RefUnwindSafe + 'static) {
+        self.cancel = if cancel.may_cancel() {
+            Some(Box::new(cancel) as Box<dyn CancelCheck + UnwindSafe + RefUnwindSafe>)
+        } else {
+            None
+        };
+    }
+
+    /// Builder form of [`set_cancel`](Self::set_cancel).
+    pub fn with_cancel(
+        mut self,
+        cancel: impl CancelCheck + UnwindSafe + RefUnwindSafe + 'static,
+    ) -> Self {
+        self.set_cancel(cancel);
+        self
+    }
+
+    /// Removes any previously set cancellation check.
+    pub fn clear_cancel(&mut self) {
+        self.cancel = None;
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.as_deref().map_or(false, |s| s.is_cancelled())
+    }
+
     /// Compresses the input data into the output, consuming only as much
     /// input as needed and writing as much output as possible.
     ///
@@ -403,6 +469,7 @@ impl Decompress {
     pub fn new(zlib_header: bool) -> Decompress {
         Decompress {
             inner: Inflate::make(zlib_header, ffi::MZ_DEFAULT_WINDOW_BITS as u8),
+            cancel: None,
         }
     }
 
@@ -424,6 +491,7 @@ impl Decompress {
         );
         Decompress {
             inner: Inflate::make(zlib_header, window_bits),
+            cancel: None,
         }
     }
 
@@ -444,6 +512,7 @@ impl Decompress {
         );
         Decompress {
             inner: Inflate::make(true, window_bits + 16),
+            cancel: None,
         }
     }
 
@@ -457,6 +526,53 @@ impl Decompress {
     /// this decompression object.
     pub fn total_out(&self) -> u64 {
         self.inner.total_out()
+    }
+
+    /// Sets a cooperative cancellation check, polled while this decompressor is
+    /// driven by a streaming `Read`/`Write` adaptor.
+    ///
+    /// When the check fires, the adaptor aborts with an error of kind
+    /// [`io::ErrorKind::Interrupted`]. This bounds the time spent on
+    /// adversarial input — for example a "zip bomb" whose tiny output never
+    /// trips an output-size check but whose enormous input would otherwise spin
+    /// for a long time inside a single `read`. Passing
+    /// [`NeverCancel`](crate::NeverCancel) (or any check whose
+    /// [`may_cancel`](CancelCheck::may_cancel) is `false`) clears it. Any `Fn() -> bool`
+    /// that is `Send + Sync` works as the check.
+    ///
+    /// The check must also be [`UnwindSafe`] + [`RefUnwindSafe`]: it is stored in
+    /// this value, which a caller may move across a [`catch_unwind`] boundary, so
+    /// requiring it keeps `Decompress` unwind-safe. Ordinary cancel sources — an
+    /// `Arc<AtomicBool>`, a cancellation token — satisfy this automatically.
+    ///
+    /// [`io::ErrorKind::Interrupted`]: std::io::ErrorKind::Interrupted
+    /// [`UnwindSafe`]: std::panic::UnwindSafe
+    /// [`RefUnwindSafe`]: std::panic::RefUnwindSafe
+    /// [`catch_unwind`]: std::panic::catch_unwind
+    pub fn set_cancel(&mut self, cancel: impl CancelCheck + UnwindSafe + RefUnwindSafe + 'static) {
+        self.cancel = if cancel.may_cancel() {
+            Some(Box::new(cancel) as Box<dyn CancelCheck + UnwindSafe + RefUnwindSafe>)
+        } else {
+            None
+        };
+    }
+
+    /// Builder form of [`set_cancel`](Self::set_cancel).
+    pub fn with_cancel(
+        mut self,
+        cancel: impl CancelCheck + UnwindSafe + RefUnwindSafe + 'static,
+    ) -> Self {
+        self.set_cancel(cancel);
+        self
+    }
+
+    /// Removes any previously set cancellation check.
+    pub fn clear_cancel(&mut self) {
+        self.cancel = None;
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.as_deref().map_or(false, |s| s.is_cancelled())
     }
 
     /// Decompresses the input data into the output, consuming only as much

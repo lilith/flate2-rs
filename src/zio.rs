@@ -6,6 +6,15 @@ use crate::{
     Compress, CompressError, Decompress, DecompressError, FlushCompress, FlushDecompress, Status,
 };
 
+/// The error returned by a streaming adaptor when its cooperative cancellation
+/// check (see [`Decompress::set_cancel`]) asks to cancel.
+fn cancelled() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "operation cancelled by the cancellation check",
+    )
+}
+
 #[derive(Debug)]
 pub struct Writer<W: Write, D: Ops> {
     obj: Option<W>,
@@ -18,6 +27,10 @@ pub trait Ops {
     type Flush: Flush;
     fn total_in(&self) -> u64;
     fn total_out(&self) -> u64;
+    /// Whether the cooperative cancellation check (if any) is asking to cancel.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
     fn run(
         &mut self,
         input: &[u8],
@@ -40,6 +53,9 @@ impl Ops for Compress {
     }
     fn total_out(&self) -> u64 {
         self.total_out()
+    }
+    fn is_cancelled(&self) -> bool {
+        Compress::is_cancelled(self)
     }
     fn run(
         &mut self,
@@ -67,6 +83,9 @@ impl Ops for Decompress {
     }
     fn total_out(&self) -> u64 {
         self.total_out()
+    }
+    fn is_cancelled(&self) -> bool {
+        Decompress::is_cancelled(self)
     }
     fn run(
         &mut self,
@@ -126,6 +145,9 @@ where
     D: Ops,
 {
     loop {
+        if data.is_cancelled() {
+            return Err(cancelled());
+        }
         let (read, consumed, ret, eof);
         {
             let input = obj.fill_buf()?;
@@ -172,6 +194,9 @@ impl<W: Write, D: Ops> Writer<W, D> {
 
     pub fn finish(&mut self) -> io::Result<()> {
         loop {
+            if self.data.is_cancelled() {
+                return Err(cancelled());
+            }
             self.dump()?;
 
             let before = self.data.total_out();
@@ -218,6 +243,9 @@ impl<W: Write, D: Ops> Writer<W, D> {
         // As a result we execute this in a loop to ensure that we try our
         // darndest to write the data.
         loop {
+            if self.data.is_cancelled() {
+                return Err(cancelled());
+            }
             self.dump()?;
 
             let before_in = self.data.total_in();
@@ -270,6 +298,9 @@ impl<W: Write, D: Ops> Write for Writer<W, D> {
         // give us a chunk of memory the same size as our own internal buffer,
         // at which point we assume it's reached the end.
         loop {
+            if self.data.is_cancelled() {
+                return Err(cancelled());
+            }
             self.dump()?;
             let before = self.data.total_out();
             self.data

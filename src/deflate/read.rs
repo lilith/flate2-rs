@@ -3,6 +3,7 @@ use std::io::prelude::*;
 
 use super::bufread;
 use crate::bufreader::BufReader;
+use crate::Decompress;
 
 /// A DEFLATE encoder, or compressor.
 ///
@@ -174,6 +175,18 @@ impl<R: Read> DeflateDecoder<R> {
     pub fn new_with_buf(r: R, buf: Vec<u8>) -> DeflateDecoder<R> {
         DeflateDecoder {
             inner: bufread::DeflateDecoder::new(BufReader::with_buf(buf, r)),
+        }
+    }
+
+    /// Creates a new decoder which will decompress data read from the given
+    /// stream, using the given `decompression` settings.
+    ///
+    /// This is the entry point for attaching a cooperative cancellation check:
+    /// build a [`Decompress`] with [`Decompress::set_cancel`] (or `with_cancel`)
+    /// and pass it here.
+    pub fn new_with_decompress(r: R, decompression: Decompress) -> DeflateDecoder<R> {
+        DeflateDecoder {
+            inner: bufread::DeflateDecoder::new_with_decompress(BufReader::new(r), decompression),
         }
     }
 }

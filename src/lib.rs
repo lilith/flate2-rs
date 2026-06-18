@@ -125,6 +125,7 @@
 #[cfg(not(feature = "any_impl",))]
 compile_error!("You need to choose a zlib backend");
 
+pub use crate::cancel::{CancelCheck, NeverCancel};
 pub use crate::crc::{Crc, CrcReader, CrcWriter};
 pub use crate::gz::GzBuilder;
 pub use crate::gz::GzHeader;
@@ -132,6 +133,7 @@ pub use crate::mem::{Compress, CompressError, Decompress, DecompressError, Statu
 pub use crate::mem::{FlushCompress, FlushDecompress};
 
 mod bufreader;
+mod cancel;
 mod crc;
 mod deflate;
 mod ffi;
